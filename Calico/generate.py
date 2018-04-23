@@ -11,8 +11,7 @@ import os.path
 #       calico.yaml
 
 MANIFEST_TEMPLATES = {
-    "calico.yaml": 
-# Calico Version v3.1.1
+    "calico.yaml": """# Calico Version v3.1.1
 # https://docs.projectcalico.org/v3.1/releases#v3.1.1
 # This manifest includes the following component versions:
 #   calico/node:v3.1.1
