@@ -11,23 +11,30 @@ import os.path
 #       calico.yaml
 
 MANIFEST_TEMPLATES = {
-    "calico.yaml": """# Calico Version v3.1.1
+    "calico.yaml": """
+
+# Canal Version v3.1.1
 # https://docs.projectcalico.org/v3.1/releases#v3.1.1
 # This manifest includes the following component versions:
 #   calico/node:v3.1.1
 #   calico/cni:v3.1.1
+#   coreos/flannel:v0.9.1
 
-# This ConfigMap is used to configure a self-hosted Calico installation.
+# This ConfigMap can be used to configure a self-hosted Canal installation.
 kind: ConfigMap
 apiVersion: v1
 metadata:
-  name: calico-config
+  name: canal-config
   namespace: kube-system
 data:
-  # To enable Typha, set this to "calico-typha" *and* set a non-zero value for Typha replicas
-  # below.  We recommend using Typha if you have more than 50 nodes. Above 100 nodes it is
-  # essential.
-  typha_service_name: "none"
+  # The interface used by canal for host <-> host communication.
+  # If left blank, then the interface is chosen using the node's
+  # default route.
+  canal_iface: ""
+
+  # Whether or not to masquerade traffic to destinations not within
+  # the pod network.
+  masquerade: "true"
 
   # The CNI network configuration to install on each node.
   cni_network_config: |-
@@ -40,7 +47,6 @@ data:
           "log_level": "info",
           "datastore_type": "kubernetes",
           "nodename": "__KUBERNETES_NODE_NAME__",
-          "mtu": 1500,
           "ipam": {
             "type": "host-local",
             "subnet": "usePodCidr"
@@ -60,106 +66,14 @@ data:
       ]
     }
 
----
-
-# This manifest creates a Service, which will be backed by Calico's Typha daemon.
-# Typha sits in between Felix and the API server, reducing Calico's load on the API server.
-
-apiVersion: v1
-kind: Service
-metadata:
-  name: calico-typha
-  namespace: kube-system
-  labels:
-    k8s-app: calico-typha
-spec:
-  ports:
-    - port: 5473
-      protocol: TCP
-      targetPort: calico-typha
-      name: calico-typha
-  selector:
-    k8s-app: calico-typha
-
----
-
-# This manifest creates a Deployment of Typha to back the above service.
-
-apiVersion: apps/v1beta1
-kind: Deployment
-metadata:
-  name: calico-typha
-  namespace: kube-system
-  labels:
-    k8s-app: calico-typha
-spec:
-  # Number of Typha replicas.  To enable Typha, set this to a non-zero value *and* set the
-  # typha_service_name variable in the calico-config ConfigMap above.
-  #
-  # We recommend using Typha if you have more than 50 nodes.  Above 100 nodes it is essential
-  # (when using the Kubernetes datastore).  Use one replica for every 100-200 nodes.  In
-  # production, we recommend running at least 3 replicas to reduce the impact of rolling upgrade.
-  replicas: 0
-  revisionHistoryLimit: 2
-  template:
-    metadata:
-      labels:
-        k8s-app: calico-typha
-      annotations:
-        # This, along with the CriticalAddonsOnly toleration below, marks the pod as a critical
-        # add-on, ensuring it gets priority scheduling and that its resources are reserved
-        # if it ever gets evicted.
-        scheduler.alpha.kubernetes.io/critical-pod: ''
-    spec:
-      hostNetwork: true
-      tolerations:
-        # Mark the pod as a critical add-on for rescheduling.
-        - key: CriticalAddonsOnly
-          operator: Exists
-      # Since Calico can't network a pod until Typha is up, we need to run Typha itself
-      # as a host-networked pod.
-      serviceAccountName: calico-node
-      containers:
-      - image: quay.io/calico/typha:v0.7.2
-        name: calico-typha
-        ports:
-        - containerPort: 5473
-          name: calico-typha
-          protocol: TCP
-        env:
-          # Enable "info" logging by default.  Can be set to "debug" to increase verbosity.
-          - name: TYPHA_LOGSEVERITYSCREEN
-            value: "info"
-          # Disable logging to file and syslog since those don't make sense in Kubernetes.
-          - name: TYPHA_LOGFILEPATH
-            value: "none"
-          - name: TYPHA_LOGSEVERITYSYS
-            value: "none"
-          # Monitor the Kubernetes API to find the number of running instances and rebalance
-          # connections.
-          - name: TYPHA_CONNECTIONREBALANCINGMODE
-            value: "kubernetes"
-          - name: TYPHA_DATASTORETYPE
-            value: "kubernetes"
-          - name: TYPHA_HEALTHENABLED
-            value: "true"
-          # Uncomment these lines to enable prometheus metrics.  Since Typha is host-networked,
-          # this opens a port on the host, which may need to be secured.
-          #- name: TYPHA_PROMETHEUSMETRICSENABLED
-          #  value: "true"
-          #- name: TYPHA_PROMETHEUSMETRICSPORT
-          #  value: "9093"
-        livenessProbe:
-          httpGet:
-            path: /liveness
-            port: 9098
-          periodSeconds: 30
-          initialDelaySeconds: 30
-        readinessProbe:
-          httpGet:
-            path: /readiness
-            port: 9098
-          periodSeconds: 10
+  # Flannel network configuration. Mounted into the flannel container.
+  net-conf.json: |
+    {
+      "Network": "$CLUSTER",
+      "Backend": {
+        "Type": "vxlan"
+      }
+    }
 
 ---
 
@@ -169,14 +83,14 @@ spec:
 kind: DaemonSet
 apiVersion: extensions/v1beta1
 metadata:
-  name: calico-node
+  name: canal
   namespace: kube-system
   labels:
-    k8s-app: calico-node
+    k8s-app: canal
 spec:
   selector:
     matchLabels:
-      k8s-app: calico-node
+      k8s-app: canal
   updateStrategy:
     type: RollingUpdate
     rollingUpdate:
@@ -184,17 +98,14 @@ spec:
   template:
     metadata:
       labels:
-        k8s-app: calico-node
+        k8s-app: canal
       annotations:
-        # This, along with the CriticalAddonsOnly toleration below,
-        # marks the pod as a critical add-on, ensuring it gets
-        # priority scheduling and that its resources are reserved
-        # if it ever gets evicted.
         scheduler.alpha.kubernetes.io/critical-pod: ''
     spec:
       hostNetwork: true
+      serviceAccountName: canal
       tolerations:
-        # Make sure calico/node gets scheduled on all nodes.
+        # Tolerate this effect so the pods will be schedulable at all times
         - effect: NoSchedule
           operator: Exists
         # Mark the pod as a critical add-on for rescheduling.
@@ -202,7 +113,6 @@ spec:
           operator: Exists
         - effect: NoExecute
           operator: Exists
-      serviceAccountName: calico-node
       # Minimize downtime during a rolling upgrade or deletion; tell Kubernetes to do a "force
       # deletion": https://kubernetes.io/docs/concepts/workloads/pods/pod/#termination-of-pods.
       terminationGracePeriodSeconds: 0
@@ -216,46 +126,37 @@ spec:
             # Use Kubernetes API as the backing datastore.
             - name: DATASTORE_TYPE
               value: "kubernetes"
-            # Enable felix info logging.
-            - name: FELIX_LOGSEVERITYSCREEN
+            # Enable felix logging.
+            - name: FELIX_LOGSEVERITYSYS
               value: "info"
             # Don't enable BGP.
             - name: CALICO_NETWORKING_BACKEND
               value: "none"
             # Cluster type to identify the deployment type
             - name: CLUSTER_TYPE
-              value: "k8s"
+              value: "k8s,canal"
             # Disable file logging so `kubectl logs` works.
             - name: CALICO_DISABLE_FILE_LOGGING
               value: "true"
-            # Set Felix endpoint to host default action to ACCEPT.
-            - name: FELIX_DEFAULTENDPOINTTOHOSTACTION
-              value: "ACCEPT"
-            # Disable IPV6 on Kubernetes.
+            # Period, in seconds, at which felix re-applies all iptables state
+            - name: FELIX_IPTABLESREFRESHINTERVAL
+              value: "60"
+            # Disable IPV6 support in Felix.
             - name: FELIX_IPV6SUPPORT
               value: "false"
             # Wait for the datastore.
             - name: WAIT_FOR_DATASTORE
               value: "true"
-            # The default IPv4 pool to create on startup if none exists. Pod IPs will be
-            # chosen from this range. Changing this value after installation will have
-            # no effect. This should fall within `--cluster-cidr`.
-            - name: CALICO_IPV4POOL_CIDR
-              value: "$CLUSTER"
-            # Enable IPIP
-            - name: CALICO_IPV4POOL_IPIP
-              value: "Always"
-            # Typha support: controlled by the ConfigMap.
-            - name: FELIX_TYPHAK8SSERVICENAME
-              valueFrom:
-                configMapKeyRef:
-                  name: calico-config
-                  key: typha_service_name
-            # Set based on the k8s node name.
+            # No IP address needed.
+            - name: IP
+              value: ""
             - name: NODENAME
               valueFrom:
                 fieldRef:
                   fieldPath: spec.nodeName
+            # Set Felix endpoint to host default action to ACCEPT.
+            - name: FELIX_DEFAULTENDPOINTTOHOSTACTION
+              value: "ACCEPT"
             - name: FELIX_HEALTHENABLED
               value: "true"
           securityContext:
@@ -291,16 +192,14 @@ spec:
           image: quay.io/calico/cni:v3.1.1
           command: ["/install-cni.sh"]
           env:
-            # Name of the CNI config file to create.
             - name: CNI_CONF_NAME
               value: "10-calico.conflist"
             # The CNI network config to install on each node.
             - name: CNI_NETWORK_CONFIG
               valueFrom:
                 configMapKeyRef:
-                  name: calico-config
+                  name: canal-config
                   key: cni_network_config
-            # Set the hostname based on the k8s node name.
             - name: KUBERNETES_NODE_NAME
               valueFrom:
                 fieldRef:
@@ -310,6 +209,37 @@ spec:
               name: cni-bin-dir
             - mountPath: /host/etc/cni/net.d
               name: cni-net-dir
+        # This container runs flannel using the kube-subnet-mgr backend
+        # for allocating subnets.
+        - name: kube-flannel
+          image: quay.io/coreos/flannel:v0.9.1
+          command: [ "/opt/bin/flanneld", "--ip-masq", "--kube-subnet-mgr" ]
+          securityContext:
+            privileged: true
+          env:
+            - name: POD_NAME
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.name
+            - name: POD_NAMESPACE
+              valueFrom:
+                fieldRef:
+                  fieldPath: metadata.namespace
+            - name: FLANNELD_IFACE
+              valueFrom:
+                configMapKeyRef:
+                  name: canal-config
+                  key: canal_iface
+            - name: FLANNELD_IP_MASQ
+              valueFrom:
+                configMapKeyRef:
+                  name: canal-config
+                  key: masquerade
+          volumeMounts:
+          - name: run
+            mountPath: /run
+          - name: flannel-cfg
+            mountPath: /etc/kube-flannel/
       volumes:
         # Used by calico/node.
         - name: lib-modules
@@ -328,6 +258,13 @@ spec:
         - name: cni-net-dir
           hostPath:
             path: /etc/cni/net.d
+        # Used by flannel.
+        - name: run
+          hostPath:
+            path: /run
+        - name: flannel-cfg
+          configMap:
+            name: canal-config
 
 # Create all the CustomResourceDefinitions needed for
 # Calico policy-only mode.
@@ -382,22 +319,6 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Host Endpoints
-kind: CustomResourceDefinition
-metadata:
-  name: hostendpoints.crd.projectcalico.org
-spec:
-  scope: Cluster
-  group: crd.projectcalico.org
-  version: v1
-  names:
-    kind: HostEndpoint
-    plural: hostendpoints
-    singular: hostendpoint
-
----
-
-apiVersion: apiextensions.k8s.io/v1beta1
 description: Calico Cluster Information
 kind: CustomResourceDefinition
 metadata:
@@ -430,6 +351,22 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
+description: Calico Network Policies
+kind: CustomResourceDefinition
+metadata:
+  name: networkpolicies.crd.projectcalico.org
+spec:
+  scope: Namespaced
+  group: crd.projectcalico.org
+  version: v1
+  names:
+    kind: NetworkPolicy
+    plural: networkpolicies
+    singular: networkpolicy
+
+---
+
+apiVersion: apiextensions.k8s.io/v1beta1
 description: Calico Global Network Sets
 kind: CustomResourceDefinition
 metadata:
@@ -446,26 +383,28 @@ spec:
 ---
 
 apiVersion: apiextensions.k8s.io/v1beta1
-description: Calico Network Policies
+description: Calico Host Endpoints
 kind: CustomResourceDefinition
 metadata:
-  name: networkpolicies.crd.projectcalico.org
+  name: hostendpoints.crd.projectcalico.org
 spec:
-  scope: Namespaced
+  scope: Cluster
   group: crd.projectcalico.org
   version: v1
   names:
-    kind: NetworkPolicy
-    plural: networkpolicies
-    singular: networkpolicy
+    kind: HostEndpoint
+    plural: hostendpoints
+    singular: hostendpoint
 
 ---
 
 apiVersion: v1
 kind: ServiceAccount
 metadata:
-  name: calico-node
+  name: canal
   namespace: kube-system
+
+
 """,
 }
 
